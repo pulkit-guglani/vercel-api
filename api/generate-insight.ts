@@ -2,10 +2,74 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
+const MAX_REQUESTS_PER_DAY = 15;
+
 interface RequestBody {
   system: string;
   prompt: string;
   allowMonthly: boolean;
+}
+
+/* ── IP-based rate limiter (in-memory, resets on cold start) ── */
+
+interface RateBucket {
+  count: number;
+  resetAt: number; // epoch ms (midnight PT)
+}
+
+const ipBuckets = new Map<string, RateBucket>();
+
+function nextMidnightPT(): number {
+  const now = new Date();
+  const pt = new Date(
+    now.toLocaleString("en-US", { timeZone: "America/Los_Angeles" }),
+  );
+  const midnight = new Date(pt);
+  midnight.setHours(24, 0, 0, 0);
+  const diff = midnight.getTime() - pt.getTime();
+  return now.getTime() + diff;
+}
+
+function getClientIp(req: VercelRequest): string {
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string") return xff.split(",")[0]!.trim();
+  if (Array.isArray(xff)) return xff[0]!.split(",")[0]!.trim();
+  return req.socket?.remoteAddress ?? "unknown";
+}
+
+function checkRateLimit(ip: string): {
+  allowed: boolean;
+  remaining: number;
+  resetAt: number;
+} {
+  const now = Date.now();
+  let bucket = ipBuckets.get(ip);
+
+  if (!bucket || now >= bucket.resetAt) {
+    bucket = { count: 0, resetAt: nextMidnightPT() };
+    ipBuckets.set(ip, bucket);
+  }
+
+  if (bucket.count >= MAX_REQUESTS_PER_DAY) {
+    return { allowed: false, remaining: 0, resetAt: bucket.resetAt };
+  }
+
+  bucket.count += 1;
+  return {
+    allowed: true,
+    remaining: MAX_REQUESTS_PER_DAY - bucket.count,
+    resetAt: bucket.resetAt,
+  };
+}
+
+function setRateLimitHeaders(
+  res: VercelResponse,
+  remaining: number,
+  resetAt: number,
+): void {
+  res.setHeader("X-RateLimit-Limit", MAX_REQUESTS_PER_DAY);
+  res.setHeader("X-RateLimit-Remaining", remaining);
+  res.setHeader("X-RateLimit-Reset", Math.ceil(resetAt / 1000));
 }
 
 interface AiInsightPayload {
@@ -31,7 +95,7 @@ async function callGemini(
       generationConfig: {
         responseMimeType: "application/json",
         temperature: 0.4,
-        maxOutputTokens: 1200,
+        maxOutputTokens: 2400,
       },
     }),
   });
@@ -81,10 +145,22 @@ export default async function handler(
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 
   if (!apiKey) {
     res.status(500).json({ error: "GEMINI_API_KEY not configured on server" });
+    return;
+  }
+
+  const ip = getClientIp(req);
+  const rl = checkRateLimit(ip);
+  setRateLimitHeaders(res, rl.remaining, rl.resetAt);
+
+  if (!rl.allowed) {
+    res.status(429).json({
+      error: "Daily limit reached",
+      resetAt: rl.resetAt,
+    });
     return;
   }
 
