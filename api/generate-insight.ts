@@ -7,7 +7,9 @@ const MAX_REQUESTS_PER_DAY = 15;
 interface RequestBody {
   system: string;
   prompt: string;
-  allowMonthly: boolean;
+  /** @deprecated Prefer `insightKind`. Kept for older app builds. */
+  allowMonthly?: boolean;
+  insightKind?: "week" | "month";
 }
 
 /* ── IP-based rate limiter (in-memory, resets on cold start) ── */
@@ -83,51 +85,185 @@ async function callGemini(
   model: string,
   system: string,
   user: string,
+  insightKind: "week" | "month",
 ): Promise<string> {
+  const generationConfigWithSchema =
+    insightKind === "month"
+      ? {
+          responseMimeType: "application/json",
+          temperature: 0.4,
+          maxOutputTokens: 2400,
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              monthly_report: { type: "STRING" },
+              suggestions: { type: "STRING" },
+            },
+            required: ["monthly_report", "suggestions"],
+          },
+        }
+      : {
+          responseMimeType: "application/json",
+          temperature: 0.4,
+          maxOutputTokens: 2400,
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              weekly_report: { type: "STRING" },
+              suggestions: { type: "STRING" },
+            },
+            required: ["weekly_report", "suggestions"],
+          },
+        };
+
+  const generationConfigMinimal = {
+    responseMimeType: "application/json",
+    temperature: 0.4,
+    maxOutputTokens: 2400,
+  };
+
   const q = new URLSearchParams({ key: apiKey });
   const url = `${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent?${q}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: system }] },
-      contents: [{ role: "user", parts: [{ text: user }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.4,
-        maxOutputTokens: 2400,
-      },
-    }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const generationConfig =
+      attempt === 0 ? generationConfigWithSchema : generationConfigMinimal;
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: user }] }],
+        generationConfig,
+      }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      if (attempt === 0 && res.status === 400) {
+        console.warn(
+          "generate-insight: Gemini rejected responseSchema, retrying without schema",
+        );
+        continue;
+      }
+      throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
+    }
+
+    const json = (await res.json()) as {
+      candidates?: { content?: { parts?: { text?: string }[] } }[];
+    };
+    const part = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!part) {
+      throw new Error("Gemini returned an empty response");
+    }
+    return part;
   }
-  const json = (await res.json()) as {
-    candidates?: { content?: { parts?: { text?: string }[] } }[];
-  };
-  const part = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!part) {
-    throw new Error("Gemini returned an empty response");
-  }
-  return part;
+
+  throw new Error("Gemini: unreachable");
 }
 
-function parsePayload(raw: string, allowMonthly: boolean): AiInsightPayload {
-  const j = JSON.parse(raw) as Record<string, unknown>;
-  const weekly = String(j.weekly_report ?? j.weeklyReport ?? "");
-  const monthly = j.monthly_report ?? j.monthlyReport;
-  const suggestions = String(j.suggestions ?? "");
-  if (!weekly || !suggestions) {
-    throw new Error("Missing weekly_report or suggestions in Gemini JSON");
+function stripCodeFences(text: string): string {
+  let t = text.trim();
+  if (t.startsWith("```")) {
+    t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "");
   }
-  if (!allowMonthly) {
+  return t.trim();
+}
+
+/** If the model wraps JSON in prose, take the outermost `{ ... }` block. */
+function extractFirstJsonObject(text: string): string {
+  const start = text.indexOf("{");
+  if (start === -1) return text;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return text.slice(start);
+}
+
+function parseJsonLenient(raw: string): Record<string, unknown> {
+  const cleaned = stripCodeFences(raw);
+  try {
+    return JSON.parse(cleaned) as Record<string, unknown>;
+  } catch {
+    try {
+      return JSON.parse(extractFirstJsonObject(cleaned)) as Record<string, unknown>;
+    } catch {
+      throw new Error(
+        `Invalid JSON from model (first 240 chars): ${cleaned.slice(0, 240)}`,
+      );
+    }
+  }
+}
+
+function pickString(j: Record<string, unknown>, ...keys: string[]): string {
+  for (const k of keys) {
+    const v = j[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return "";
+}
+
+const MONTH_SUGGESTIONS_FALLBACK =
+  "Next month: pick one non-negotiable anchor day, log it the night before, and review skips weekly so patterns do not repeat.";
+
+function parsePayload(raw: string, insightKind: "week" | "month"): AiInsightPayload {
+  const j = parseJsonLenient(raw);
+
+  if (insightKind === "week") {
+    const weekly = pickString(
+      j,
+      "weekly_report",
+      "weeklyReport",
+      "week_report",
+      "report",
+    );
+    const suggestions = pickString(
+      j,
+      "suggestions",
+      "suggestion",
+      "coaching",
+      "coach_notes",
+    );
+    if (!weekly) {
+      throw new Error("Missing weekly_report in Gemini JSON");
+    }
+    if (!suggestions) {
+      throw new Error("Missing suggestions in Gemini JSON");
+    }
     return { weekly_report: weekly, monthly_report: null, suggestions };
   }
-  if (typeof monthly === "string" && monthly.length > 0) {
-    return { weekly_report: weekly, monthly_report: monthly, suggestions };
+
+  let monthly = pickString(
+    j,
+    "monthly_report",
+    "monthlyReport",
+    "month_report",
+    "report",
+  );
+  if (!monthly) {
+    monthly = pickString(j, "weekly_report", "weeklyReport");
   }
-  return { weekly_report: weekly, monthly_report: null, suggestions };
+  if (!monthly) {
+    throw new Error("Missing monthly_report in Gemini JSON");
+  }
+  let suggestions = pickString(
+    j,
+    "suggestions",
+    "suggestion",
+    "coaching",
+    "coach_notes",
+  );
+  if (!suggestions) {
+    suggestions = MONTH_SUGGESTIONS_FALLBACK;
+  }
+  return { weekly_report: "", monthly_report: monthly, suggestions };
 }
 
 export default async function handler(
@@ -165,15 +301,38 @@ export default async function handler(
   }
 
   try {
-    const { system, prompt, allowMonthly } = req.body as RequestBody;
+    let body = req.body as RequestBody;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body) as RequestBody;
+      } catch {
+        res.status(400).json({ error: "Invalid JSON body" });
+        return;
+      }
+    }
+
+    const { system, prompt } = body;
 
     if (!system || !prompt) {
       res.status(400).json({ error: "Missing required fields: system, prompt" });
       return;
     }
 
-    const raw = await callGemini(apiKey, model, system, `DATA (compressed):\n${prompt}`);
-    const payload = parsePayload(raw, allowMonthly ?? false);
+    const insightKind: "week" | "month" =
+      body.insightKind === "week" || body.insightKind === "month"
+        ? body.insightKind
+        : body.allowMonthly === true
+          ? "month"
+          : "week";
+
+    const raw = await callGemini(
+      apiKey,
+      model,
+      system,
+      `DATA (compressed):\n${prompt}`,
+      insightKind,
+    );
+    const payload = parsePayload(raw, insightKind);
 
     res.status(200).json(payload);
   } catch (err: unknown) {
