@@ -17,6 +17,12 @@ HTML OUTPUT (required for weekly_report, monthly_report, and suggestions string 
   • time-of-day or early/late drift summarized by row.
   Keep tables small (≤6 rows, ≤4 columns). Include <thead><tr><th>...</th></tr></thead> and <tbody> with <tr><td>...</td></tr>.
 - Do NOT add a table or list every time — use plain <p> prose when that is enough. When you use a table or list, still include at least one <p> opening or closing the narrative.
+
+MONTHLY REPORT (monthly_report field only):
+- Start monthly_report with these two lines (compute from DATA; target days only, exclude "x" rest days):
+  <p><strong>Best streak:</strong> {longest consecutive done streak in the month, with optional date span}</p>
+  <p><strong>Missed days:</strong> {count of target days not completed — skips and no-log; optional split in parentheses}</p>
+- Then continue with narrative <p> blocks (and optional table/list). Use <strong>Label:</strong> value in the same tag, never markdown bold.
 - JSON safety: escape double quotes inside HTML as \\". No raw newlines inside JSON strings; use <br/> or separate <p> tags instead.
 - No <a>, <img>, <script>, inline styles, or class attributes. English only.
 `.trim();

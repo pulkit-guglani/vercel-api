@@ -3,10 +3,27 @@ import { augmentSystemForHtml } from "../prompt-html";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
-/** Room for HTML fragments (paragraphs + optional tables/lists) inside JSON. */
-const MAX_OUTPUT_TOKENS = 8192;
+/** Room for HTML fragments (paragraphs + tables/lists) inside JSON. */
+const MAX_OUTPUT_TOKENS = 3048;
 
+/** Per-client cap (independent of Google model quotas). */
 const MAX_REQUESTS_PER_DAY = 15;
+
+interface InsightModelEntry {
+  id: string;
+  rpm: number;
+  rpd: number;
+}
+
+/**
+ * Free-tier chain (highest priority first).
+ * Fallback when local/API quota is hit or the request fails.
+ */
+const MODEL_CHAIN: InsightModelEntry[] = [
+  { id: "gemini-3.1-flash-lite", rpm: 15, rpd: 500 },
+  { id: "gemma-4-31b-it", rpm: 15, rpd: 1500 },
+  { id: "gemma-4-26b-a4b-it", rpm: 15, rpd: 1500 },
+];
 
 interface RequestBody {
   system: string;
@@ -20,10 +37,22 @@ interface RequestBody {
 
 interface RateBucket {
   count: number;
-  resetAt: number; // epoch ms (midnight PT)
+  resetAt: number;
 }
 
 const ipBuckets = new Map<string, RateBucket>();
+
+/* ── Per-model quota tracker (API key free tier; resets on cold start) ── */
+
+interface ModelQuotaBucket {
+  dayCount: number;
+  dayResetAt: number;
+  minuteCount: number;
+  minuteResetAt: number;
+  exhaustedUntil: number;
+}
+
+const modelBuckets = new Map<string, ModelQuotaBucket>();
 
 function nextMidnightPT(): number {
   const now = new Date();
@@ -34,6 +63,52 @@ function nextMidnightPT(): number {
   midnight.setHours(24, 0, 0, 0);
   const diff = midnight.getTime() - pt.getTime();
   return now.getTime() + diff;
+}
+
+function getModelBucket(modelId: string): ModelQuotaBucket {
+  const now = Date.now();
+  let bucket = modelBuckets.get(modelId);
+  if (!bucket) {
+    bucket = {
+      dayCount: 0,
+      dayResetAt: nextMidnightPT(),
+      minuteCount: 0,
+      minuteResetAt: now + 60_000,
+      exhaustedUntil: 0,
+    };
+    modelBuckets.set(modelId, bucket);
+    return bucket;
+  }
+  if (now >= bucket.dayResetAt) {
+    bucket.dayCount = 0;
+    bucket.dayResetAt = nextMidnightPT();
+    bucket.exhaustedUntil = 0;
+  }
+  if (now >= bucket.minuteResetAt) {
+    bucket.minuteCount = 0;
+    bucket.minuteResetAt = now + 60_000;
+  }
+  return bucket;
+}
+
+function isModelQuotaAvailable(model: InsightModelEntry): boolean {
+  const bucket = getModelBucket(model.id);
+  const now = Date.now();
+  if (now < bucket.exhaustedUntil) return false;
+  if (bucket.dayCount >= model.rpd) return false;
+  if (bucket.minuteCount >= model.rpm) return false;
+  return true;
+}
+
+function recordModelRequest(modelId: string): void {
+  const bucket = getModelBucket(modelId);
+  bucket.dayCount += 1;
+  bucket.minuteCount += 1;
+}
+
+function markModelExhausted(modelId: string, untilMs?: number): void {
+  const bucket = getModelBucket(modelId);
+  bucket.exhaustedUntil = untilMs ?? nextMidnightPT();
 }
 
 function getClientIp(req: VercelRequest): string {
@@ -84,13 +159,30 @@ interface AiInsightPayload {
   suggestions: string;
 }
 
-async function callGemini(
-  apiKey: string,
-  model: string,
-  system: string,
-  user: string,
-  insightKind: "week" | "month",
-): Promise<string> {
+function isGeminiFamilyModel(modelId: string): boolean {
+  return modelId.startsWith("gemini-");
+}
+
+function isQuotaOrRateLimitError(status: number, body: string): boolean {
+  if (status === 429) return true;
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("quota") ||
+    lower.includes("rate limit") ||
+    lower.includes("resource exhausted") ||
+    lower.includes("too many requests")
+  );
+}
+
+function shouldFailoverToNextModel(status: number, body: string): boolean {
+  if (isQuotaOrRateLimitError(status, body)) return true;
+  if (status === 503 || status === 502 || status === 504) return true;
+  if (status === 404) return true;
+  if (status >= 500) return true;
+  return false;
+}
+
+function buildGenerationConfigs(insightKind: "week" | "month", useSchema: boolean) {
   const generationConfigWithSchema =
     insightKind === "month"
       ? {
@@ -126,12 +218,37 @@ async function callGemini(
     maxOutputTokens: MAX_OUTPUT_TOKENS,
   };
 
+  if (!useSchema) {
+    return [generationConfigMinimal];
+  }
+  return [generationConfigWithSchema, generationConfigMinimal];
+}
+
+type ModelCallResult =
+  | { ok: true; text: string }
+  | {
+      ok: false;
+      failover: boolean;
+      quotaExceeded: boolean;
+      message: string;
+    };
+
+async function callModelOnce(
+  apiKey: string,
+  model: string,
+  system: string,
+  user: string,
+  insightKind: "week" | "month",
+): Promise<ModelCallResult> {
+  const useSchema = isGeminiFamilyModel(model);
+  const configs = buildGenerationConfigs(insightKind, useSchema);
   const q = new URLSearchParams({ key: apiKey });
   const url = `${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent?${q}`;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const generationConfig =
-      attempt === 0 ? generationConfigWithSchema : generationConfigMinimal;
+  let lastMessage = "Unknown model error";
+
+  for (let attempt = 0; attempt < configs.length; attempt++) {
+    const generationConfig = configs[attempt]!;
 
     const res = await fetch(url, {
       method: "POST",
@@ -145,26 +262,100 @@ async function callGemini(
 
     if (!res.ok) {
       const t = await res.text();
-      if (attempt === 0 && res.status === 400) {
+      lastMessage = `${model} ${res.status}: ${t.slice(0, 300)}`;
+      if (attempt === 0 && res.status === 400 && useSchema) {
         console.warn(
-          "generate-insight: Gemini rejected responseSchema, retrying without schema",
+          `generate-insight: ${model} rejected responseSchema, retrying without schema`,
         );
         continue;
       }
-      throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
+      return {
+        ok: false,
+        failover: shouldFailoverToNextModel(res.status, t),
+        quotaExceeded: isQuotaOrRateLimitError(res.status, t),
+        message: lastMessage,
+      };
     }
 
     const json = (await res.json()) as {
       candidates?: { content?: { parts?: { text?: string }[] } }[];
     };
     const part = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!part) {
-      throw new Error("Gemini returned an empty response");
+    if (!part?.trim()) {
+      return {
+        ok: false,
+        failover: true,
+        quotaExceeded: false,
+        message: `${model} returned an empty response`,
+      };
     }
-    return part;
+    return { ok: true, text: part };
   }
 
-  throw new Error("Gemini: unreachable");
+  return {
+    ok: false,
+    failover: true,
+    quotaExceeded: false,
+    message: lastMessage,
+  };
+}
+
+async function callWithModelFallback(
+  apiKey: string,
+  system: string,
+  user: string,
+  insightKind: "week" | "month",
+): Promise<{ text: string; modelUsed: string }> {
+  const primaryOverride = process.env.GEMINI_MODEL?.trim();
+  const chain: InsightModelEntry[] = [...MODEL_CHAIN];
+  if (primaryOverride && primaryOverride !== chain[0]!.id) {
+    const idx = chain.findIndex((m) => m.id === primaryOverride);
+    if (idx > 0) {
+      const [picked] = chain.splice(idx, 1);
+      chain.unshift(picked!);
+    } else if (idx === -1) {
+      chain.unshift({ id: primaryOverride, rpm: 15, rpd: 500 });
+    }
+  }
+
+  const errors: string[] = [];
+
+  for (const model of chain) {
+    if (!isModelQuotaAvailable(model)) {
+      errors.push(`${model.id}: local free-tier quota exhausted`);
+      continue;
+    }
+
+    recordModelRequest(model.id);
+    const result = await callModelOnce(
+      apiKey,
+      model.id,
+      system,
+      user,
+      insightKind,
+    );
+
+    if (result.ok) {
+      console.info(`generate-insight: success via ${model.id}`);
+      return { text: result.text, modelUsed: model.id };
+    }
+
+    errors.push(result.message);
+    console.warn(`generate-insight: ${model.id} failed — ${result.message}`);
+
+    if (result.failover) {
+      if (result.quotaExceeded) {
+        markModelExhausted(model.id);
+      }
+      continue;
+    }
+
+    throw new Error(result.message);
+  }
+
+  throw new Error(
+    `All models unavailable. ${errors.join(" | ")}`,
+  );
 }
 
 function stripCodeFences(text: string): string {
@@ -175,7 +366,6 @@ function stripCodeFences(text: string): string {
   return t.trim();
 }
 
-/** If the model wraps JSON in prose, take the outermost `{ ... }` block. */
 function extractFirstJsonObject(text: string): string {
   const start = text.indexOf("{");
   if (start === -1) return text;
@@ -285,7 +475,6 @@ export default async function handler(
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 
   if (!apiKey) {
     res.status(500).json({ error: "GEMINI_API_KEY not configured on server" });
@@ -331,15 +520,15 @@ export default async function handler(
 
     const systemWithHtml = augmentSystemForHtml(system);
 
-    const raw = await callGemini(
+    const { text: raw, modelUsed } = await callWithModelFallback(
       apiKey,
-      model,
       systemWithHtml,
       `DATA (compressed):\n${prompt}`,
       insightKind,
     );
     const payload = parsePayload(raw, insightKind);
 
+    res.setHeader("X-Model-Used", modelUsed);
     res.status(200).json(payload);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";
