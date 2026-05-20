@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "vercel dev",
-    "deploy": "vercel --prod"
+    "deploy": "npx vercel@latest --prod"
   },
   "dependencies": {
     "dayjs": "^1.11.19"
@@ -13,6 +13,6 @@
     "@types/node": "^20.14.0",
     "@vercel/node": "^3.2.0",
     "typescript": "~5.9.2",
-    "vercel": "^39.0.0"
+    "vercel": "^54.2.0"
   }
 }
