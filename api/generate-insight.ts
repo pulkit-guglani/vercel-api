@@ -1,6 +1,10 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+import { augmentSystemForHtml } from "../prompt-html";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
+
+/** Room for HTML fragments (paragraphs + optional tables/lists) inside JSON. */
+const MAX_OUTPUT_TOKENS = 8192;
 
 const MAX_REQUESTS_PER_DAY = 15;
 
@@ -92,7 +96,7 @@ async function callGemini(
       ? {
           responseMimeType: "application/json",
           temperature: 0.4,
-          maxOutputTokens: 2400,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
           responseSchema: {
             type: "OBJECT",
             properties: {
@@ -105,7 +109,7 @@ async function callGemini(
       : {
           responseMimeType: "application/json",
           temperature: 0.4,
-          maxOutputTokens: 2400,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
           responseSchema: {
             type: "OBJECT",
             properties: {
@@ -119,7 +123,7 @@ async function callGemini(
   const generationConfigMinimal = {
     responseMimeType: "application/json",
     temperature: 0.4,
-    maxOutputTokens: 2400,
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
   };
 
   const q = new URLSearchParams({ key: apiKey });
@@ -211,7 +215,7 @@ function pickString(j: Record<string, unknown>, ...keys: string[]): string {
 }
 
 const MONTH_SUGGESTIONS_FALLBACK =
-  "Next month: pick one non-negotiable anchor day, log it the night before, and review skips weekly so patterns do not repeat.";
+  "<ol><li>Pick one non-negotiable anchor day and log it the night before.</li><li>Review skips weekly so patterns do not repeat.</li><li>Protect your best weekday with a calendar block.</li></ol>";
 
 function parsePayload(raw: string, insightKind: "week" | "month"): AiInsightPayload {
   const j = parseJsonLenient(raw);
@@ -325,10 +329,12 @@ export default async function handler(
           ? "month"
           : "week";
 
+    const systemWithHtml = augmentSystemForHtml(system);
+
     const raw = await callGemini(
       apiKey,
       model,
-      system,
+      systemWithHtml,
       `DATA (compressed):\n${prompt}`,
       insightKind,
     );
